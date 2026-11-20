@@ -1,0 +1,33 @@
+lr=1.0, weight_decay=0.01, epochs=9, ccp_alpha=0.0009363801778857692
+
+Decision tree rules (class 0 = FoxNews, class 1 = NBC):
+|--- segcount3 <= 0.50
+|   |--- wellness <= 0.50
+|   |   |--- class: 0
+|   |--- wellness >  0.50
+|   |   |--- class: 1
+|--- segcount3 >  0.50
+|   |--- class: 1
+
+Logistic regression: 10 words that push most towards FoxNews:
+  segcount2                 -1.895
+  after                     -0.598
+  trump/zero                -0.528
+  says                      -0.373
+  over                      -0.314
+  from                      -0.280
+  mamdani                   -0.245
+  sheriffs/spends/us        -0.240
+  shutdown/vacuum           -0.230
+  new                       -0.227
+Logistic regression: 10 words that push most towards NBC:
+  segcount3                 +2.055
+  nbcidtoken/proposals      +1.617
+  best/singers              +0.497
+  deals                     +0.203
+  day                       +0.189
+  of                        +0.173
+  awards                    +0.165
+  flip/prime                +0.145
+  amazon                    +0.143
+  notable                   +0.142
