@@ -25,14 +25,14 @@ from model import (
 )
 # ORIGINAL: from preprocess import prepare_data
 # NEW: also import the baseline cleaning (for the baseline comparison) and our new cleaning
-from preprocess import NBC_ID_PATTERN, _slug_to_text, prepare_data, url_to_text
+from preprocess import _slug_to_text, prepare_data, url_to_text
 
 # NEW imports
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # save figures to files, no window needed
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader  # same imports as hw3_skeleton.ipynb cell 70
 from urllib.parse import urlparse
 from scipy.sparse import csr_matrix
 from sklearn.tree import DecisionTreeClassifier, export_text
@@ -177,48 +177,6 @@ def train(
 # NEW: helper functions for the new model
 # ===========================================================================
 
-def make_probe_sets(test_urls, test_y):
-    """Build two small robustness test sets from the links of ONE split.
-
-    NEW (second version): called twice - on the validation split (used to choose
-    hyperparameters) and on the test split (used only for the final report), so
-    the test split never influences any choice (L04 p.21, "validation hygiene").
-
-    The training data has almost no NBC news (94% of NBC links are shopping
-    articles), but the leaderboard probably has many. These probes check
-    whether a model looks at the link FORMAT or only at the TOPIC:
-
-      - "NBC politics probe": a Fox political headline written in NBC's link
-        format (3 path parts + NBC-style ID). True label: NBC.
-      - "Fox shopping probe": an NBC shopping headline written in Fox's link
-        format (2 path parts, no ID). True label: FoxNews.
-
-    These links are made up by us. They only test whether the model uses the
-    link format; they are NOT an estimate of the leaderboard accuracy.
-    Idea: a validation set should look like the real exam (L04_Linear
-    Regression (contd.).pdf p.18).
-
-    Returns:
-        probes: dict name -> (list of urls, numpy array of label ids)
-    """
-    politics_urls = []
-    shopping_urls = []
-    for i in range(len(test_urls)):
-        path = urlparse(test_urls[i]).path
-        segments = [seg for seg in path.split("/") if seg]
-        slug = segments[-1]
-        if test_y[i] == 0 and segments[0] in ["politics", "us", "world"]:
-            politics_urls.append("/politics/congress/" + slug + "-rcna123456")
-        if test_y[i] == 1 and segments[0] == "select":
-            slug_no_id = re.sub(NBC_ID_PATTERN, "", slug)
-            shopping_urls.append("/lifestyle/" + slug_no_id)
-
-    probes = {}
-    probes["NBC politics probe"] = (politics_urls, np.ones(len(politics_urls), dtype=int))
-    probes["Fox shopping probe"] = (shopping_urls, np.zeros(len(shopping_urls), dtype=int))
-    return probes
-
-
 def compute_metrics(pred_ids, true_ids):
     """Accuracy, confusion matrix, precision and recall.
 
@@ -246,38 +204,134 @@ def compute_metrics(pred_ids, true_ids):
     return metrics
 
 
-def predict_probs_in_chunks(model, id_lists, which, chunk_size=500):
-    """Class probabilities of one sub-model (or the ensemble), shape (N, 2).
+def take_items(items, idx):
+    """Return [items[i] for every i in idx], written as a plain loop."""
+    out = []
+    for i in idx:
+        out.append(items[i])
+    return out
 
-    We build the count vectors a chunk at a time, because a (N, 50000) matrix
-    for all rows at once would use too much memory.
+
+class UrlCountDataset(Dataset):
+    """A PyTorch Dataset of links, same pattern as STKDataset in hw3_skeleton.ipynb cell 75.
+
+    Each item is the bag-of-words count vector of one link (and its label).
+    The count vector is built only when the item is asked for, so we never
+    hold a full (N, 50000) matrix in memory.
+
+    Args:
+        id_lists: output of texts_to_bucket_ids (one list of bucket ids per link)
+        labels: label ids (0 = FoxNews, 1 = NBC), or None when there are no labels
+    """
+
+    def __init__(self, id_lists, labels=None):
+        self.id_lists = id_lists
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.id_lists)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        # count vector of link idx, shape (NUM_BUCKETS,)
+        counts = bucket_ids_to_counts([self.id_lists[idx]])[0]
+
+        if self.labels is not None:
+            label = int(self.labels[idx])
+            return counts, label
+        return counts
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    One pass over dataloader, updating the model.
+    Same as train_one_epoch in hw3_skeleton.ipynb cell 89
+    (and the training function of L10_Neural Networks (ctd).pdf p.30).
+
+    OUTPUT:
+    avg_loss - float, the mean of the batch losses
+    accuracy - float, the fraction of samples predicted correctly
+    """
+    model.train()
+    total_loss = 0
+    num_data = 0
+    correct = 0
+
+    for (x, y) in dataloader:
+        inputs, label = x.to(device), y.to(device)
+        forward = model(inputs)
+        loss = criterion(forward, label)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        y_hat = forward.argmax(dim=1)
+        correct += (y_hat == label).sum().item()
+        num_data += y.shape[0]
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = correct / num_data
+    return avg_loss, accuracy
+
+
+def evaluate(model, dataloader, criterion, device):
+    """
+    One pass over dataloader WITHOUT updating the model.
+    Same as evaluate in hw3_skeleton.ipynb cell 89.
+
+    OUTPUT:
+    avg_loss - float, the mean of the batch losses
+    accuracy - float, the fraction of samples predicted correctly
+    """
+    model.eval()
+    total_loss = 0
+    num_data = 0
+    correct = 0
+
+    with torch.no_grad():
+        for (x, y) in dataloader:
+            inputs, label = x.to(device), y.to(device)
+            forward = model(inputs)
+            loss = criterion(forward, label)
+
+            total_loss += loss.item()
+
+            y_hat = forward.argmax(dim=1)
+            correct += (y_hat == label).sum().item()
+            num_data += y.shape[0]
+
+        avg_loss = total_loss / len(dataloader)
+        accuracy = correct / num_data
+    return avg_loss, accuracy
+
+
+def predict_probs(model, id_lists, which, batch_size=500):
+    """Class probabilities of one sub-model (or the ensemble), as an (N, 2) numpy array.
+
+    Same pattern as predict in hw3_skeleton.ipynb cell 92: model.eval(),
+    torch.no_grad(), loop over a DataLoader with no labels, collect the results in a list.
 
     Args:
         which: "lr", "tree" or "ensemble"
     """
+    dataloader = DataLoader(UrlCountDataset(id_lists), batch_size=batch_size, shuffle=False)
     model.eval()
     all_probs = []
     with torch.no_grad():
-        for start in range(0, len(id_lists), chunk_size):
-            counts = bucket_ids_to_counts(id_lists[start:start + chunk_size])
+        for x in dataloader:
             if which == "lr":
-                probs = model.lr_probs(counts)
+                probs = model.lr_probs(x)
             elif which == "tree":
-                probs = model.tree_probs(counts)
+                probs = model.tree_probs(x)
             else:
-                probs = model.ensemble_probs(counts)
-            all_probs.append(probs)
-    return torch.cat(all_probs, dim=0)
-
-
-def lr_loss_and_accuracy(model, id_lists, y):
-    """Cross-entropy loss and accuracy of the logistic regression part."""
-    probs = predict_probs_in_chunks(model, id_lists, "lr")
-    y_t = torch.tensor(y, dtype=torch.long)
-    # cross-entropy = mean of -log p(true class)   (L08 p.7)
-    loss = F.nll_loss(torch.log(probs + 1e-12), y_t).item()
-    acc = (probs.argmax(dim=1) == y_t).float().mean().item()
-    return loss, acc
+                probs = model.ensemble_probs(x)
+            for row in probs.tolist():
+                all_probs.append(row)
+    return np.array(all_probs)
 
 
 def make_optimizer(model, optimizer_name, lr, weight_decay):
@@ -295,9 +349,10 @@ def make_optimizer(model, optimizer_name, lr, weight_decay):
       "adamw" : AdamW (L10_Neural Networks (ctd).pdf p.42). Kept only as a
                 comparison experiment. Adam divides each weight's step by the size
                 of that weight's own past gradients, so a rare headline word gets
-                steps as large as the format tokens that appear in every link. In
-                our runs this made LR rely on topic words: about 99% validation
-                accuracy, but only 15% / 0.4% on the two robustness probes.
+                steps as large as the format tokens that appear in every link, so
+                LR leans more on topic words. (AdamW gets a higher validation
+                accuracy here, but our validation set has almost no NBC news links,
+                so that score cannot show this weakness.)
     """
     groups = [{"params": [model.linear.weight], "weight_decay": weight_decay},
               {"params": [model.linear.bias], "weight_decay": 0.0}]
@@ -307,90 +362,62 @@ def make_optimizer(model, optimizer_name, lr, weight_decay):
 
 
 def train_logistic_regression(model, train_ids, y_train, val_ids, y_val,
-                              lr, weight_decay, max_epochs, batch_size, patience=3,
-                              optimizer_name="sgd"):
+                              lr, weight_decay, max_epochs, batch_size, checkpoint_path,
+                              patience=3, optimizer_name="sgd"):
     """Train the logistic regression part with mini-batch SGD + early stopping.
 
-    - Loss: cross-entropy (softmax + negative log-likelihood), L08 p.7;
-      for 2 classes this is the logistic regression loss of L07 p.22.
-    - Mini-batch SGD: shuffle, then one step per batch, L10_Neural Networks (ctd).pdf p.36.
+    The epoch loop is the one in hw3_skeleton.ipynb cell 90 (train_one_epoch,
+    then evaluate, then record the history), plus early stopping.
+
+    - Loss: cross-entropy, nn.CrossEntropyLoss as in hw3_skeleton.ipynb cell 88
+      (softmax + negative log-likelihood, L08 p.7; for 2 classes this is the
+      logistic regression loss of L07 p.22).
+    - Mini-batch SGD: shuffled mini-batches from a DataLoader, L10_Neural Networks (ctd).pdf p.36.
     - L2 regularization / weight decay on the weights but NOT on the bias,
       L11_Neural Networks (ctd)+K-Nearest Neighbors and Decision Trees.pdf p.17
       (see make_optimizer).
-    - Early stopping: keep the checkpoint with the lowest validation loss and
+    - Early stopping: save the checkpoint with the lowest validation loss and
       stop when it has not improved for `patience` epochs, L11 p.24.
 
     Returns:
         best_epoch: the epoch whose weights we kept
         history: per-epoch train/val loss and accuracy
     """
-    train_y_t = torch.tensor(y_train, dtype=torch.long)
+    # Step 1: data loaders, shuffle the training data only (hw3_skeleton.ipynb cell 82)
+    train_dataloader = DataLoader(UrlCountDataset(train_ids, y_train), batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(UrlCountDataset(val_ids, y_val), batch_size=batch_size, shuffle=False)
 
-    # Step 1: weights get weight decay, the bias does not
-    # ORIGINAL (first version): AdamW
-    # optimizer = torch.optim.AdamW(
-    #     [{"params": [model.linear.weight], "weight_decay": weight_decay},
-    #      {"params": [model.linear.bias], "weight_decay": 0.0}], lr=lr)
-    # NEW: plain SGD by default (see make_optimizer for why)
+    # Step 2: loss and optimizer (weights get weight decay, the bias does not)
+    criterion = nn.CrossEntropyLoss()
     optimizer = make_optimizer(model, optimizer_name, lr, weight_decay)
 
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_val_loss = float("inf")
     best_epoch = 0
-    best_weight = model.linear.weight.detach().clone()
-    best_bias = model.linear.bias.detach().clone()
     epochs_without_improvement = 0
 
-    n_train = len(train_ids)
     for epoch in range(1, max_epochs + 1):
-        # Step 2: one pass over the shuffled training data, one step per mini-batch
-        model.train()
-        indices = np.random.permutation(n_train)
-        total_loss = 0.0
-        correct = 0
-        for start in range(0, n_train, batch_size):
-            idx = indices[start:start + batch_size]
-            batch_ids = []
-            for i in idx:
-                batch_ids.append(train_ids[i])
-            counts = bucket_ids_to_counts(batch_ids)
-            targets = train_y_t[idx]
-
-            optimizer.zero_grad()
-            logits = model(counts)
-            loss = F.cross_entropy(logits, targets)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * len(idx)
-            correct += (logits.argmax(dim=1) == targets).sum().item()
-
-        train_loss = total_loss / n_train
-        train_acc = correct / n_train
-
-        # Step 3: check the validation set
-        val_loss, val_acc = lr_loss_and_accuracy(model, val_ids, y_val)
+        # Step 3: one pass over the training data, then check the validation set
+        train_loss, train_acc = train_one_epoch(model, train_dataloader, criterion, optimizer, "cpu")
+        val_loss, val_acc = evaluate(model, val_dataloader, criterion, "cpu")
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
 
-        # Step 4: early stopping - keep the best checkpoint
+        # Step 4: early stopping - save the best checkpoint to a file
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            best_weight = model.linear.weight.detach().clone()
-            best_bias = model.linear.bias.detach().clone()
+            torch.save(model.state_dict(), checkpoint_path)
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
                 break
 
-    # Step 5: put the best weights back into the model
-    with torch.no_grad():
-        model.linear.weight.copy_(best_weight)
-        model.linear.bias.copy_(best_bias)
+    # Step 5: load the best checkpoint back into the model
+    model.load_state_dict(torch.load(checkpoint_path))
     return best_epoch, history
 
 
@@ -400,27 +427,11 @@ def train_logistic_regression_fixed_epochs(model, all_ids, all_y, lr, weight_dec
     Used for the final model trained on all the data, where there is no
     validation set left to decide when to stop.
     """
-    all_y_t = torch.tensor(all_y, dtype=torch.long)
-    # ORIGINAL (first version): AdamW
-    # optimizer = torch.optim.AdamW(
-    #     [{"params": [model.linear.weight], "weight_decay": weight_decay},
-    #      {"params": [model.linear.bias], "weight_decay": 0.0}], lr=lr)
-    # NEW: plain SGD, same as in train_logistic_regression
+    train_dataloader = DataLoader(UrlCountDataset(all_ids, all_y), batch_size=batch_size, shuffle=True)
+    criterion = nn.CrossEntropyLoss()
     optimizer = make_optimizer(model, "sgd", lr, weight_decay)
-    n = len(all_ids)
-    model.train()
     for epoch in range(epochs):
-        indices = np.random.permutation(n)
-        for start in range(0, n, batch_size):
-            idx = indices[start:start + batch_size]
-            batch_ids = []
-            for i in idx:
-                batch_ids.append(all_ids[i])
-            counts = bucket_ids_to_counts(batch_ids)
-            optimizer.zero_grad()
-            loss = F.cross_entropy(model(counts), all_y_t[idx])
-            loss.backward()
-            optimizer.step()
+        train_one_epoch(model, train_dataloader, criterion, optimizer, "cpu")
 
 
 def build_sparse_counts(id_lists):
@@ -647,40 +658,19 @@ def main():
     train_idx, rest_idx = train_test_split(all_idx, test_size=0.2, random_state=args.seed, stratify=y_all)
     val_idx, test_idx = train_test_split(rest_idx, test_size=0.5, random_state=args.seed, stratify=y_all[rest_idx])
 
-    def take(items, idx):
-        out = []
-        for i in idx:
-            out.append(items[i])
-        return out
-
-    train_texts, val_texts, test_texts = take(texts, train_idx), take(texts, val_idx), take(texts, test_idx)
-    train_urls, val_urls, test_urls = take(raw_urls, train_idx), take(raw_urls, val_idx), take(raw_urls, test_idx)
+    train_texts = take_items(texts, train_idx)
+    val_texts = take_items(texts, val_idx)
+    test_texts = take_items(texts, test_idx)
+    train_urls = take_items(raw_urls, train_idx)
+    val_urls = take_items(raw_urls, val_idx)
+    test_urls = take_items(raw_urls, test_idx)
     y_train, y_val, y_test = y_all[train_idx], y_all[val_idx], y_all[test_idx]
     print("Split sizes: train", len(train_idx), "| val", len(val_idx), "| test", len(test_idx))
-
-    # Robustness probes (see make_probe_sets)
-    # ORIGINAL (first version): probes from the test split only
-    # probes = make_probe_sets(test_urls, y_test)
-    # NEW: validation-split probes for choosing hyperparameters,
-    #      test-split probes only for the final report
-    val_probes = make_probe_sets(val_urls, y_val)
-    probes = make_probe_sets(test_urls, y_test)
-    for name in probes:
-        print(f"{name}: {len(val_probes[name][0])} made-up links from val, "
-              f"{len(probes[name][0])} from test")
-    val_probe_ids = {}
-    for name in val_probes:
-        new_texts = []
-        for url in val_probes[name][0]:
-            new_texts.append(url_to_text(url))
-        val_probe_ids[name] = texts_to_bucket_ids(new_texts)
 
     # Every evaluation set as raw urls + labels, so each model can clean them its own way
     eval_sets = {
         "val": (val_urls, y_val),
         "test": (test_urls, y_test),
-        "NBC politics probe": probes["NBC politics probe"],
-        "Fox shopping probe": probes["Fox shopping probe"],
     }
 
     # Hash every text once and reuse the bucket ids (saves time)
@@ -733,49 +723,37 @@ def main():
     # the validation set (grid search on a log scale: L04 p.16, L11 p.28-29)
     # -----------------------------------------------------------------------
     print("\n=== Logistic regression: hyperparameter search on the validation set ===")
-    # ORIGINAL (first version): AdamW learning rates, choose by validation accuracy only
-    # lr_grid = [0.001, 0.01]
-    # weight_decay_grid = [0.0, 0.001, 0.01, 0.1, 1.0]
-    # NEW: plain SGD needs larger learning rates
+    # plain SGD needs larger learning rates than Adam
     lr_grid = [0.1, 0.3, 1.0]
     weight_decay_grid = [0.0, 0.001, 0.01]
     search_rows = []
+    max_score = 0
     best = None
+    checkpoint_path = os.path.join(args.results_dir, "best_lr_checkpoint.pt")
+    criterion = nn.CrossEntropyLoss()
+    val_dataloader = DataLoader(UrlCountDataset(val_ids, y_val), batch_size=args.batch_size, shuffle=False)
     for lr in lr_grid:
         for wd in weight_decay_grid:
             set_seed(args.seed)  # same random start for every setting (L11 p.29)
             model = NewsClassifier()
             best_epoch, history = train_logistic_regression(
                 model, train_ids, y_train, val_ids, y_val,
-                lr=lr, weight_decay=wd, max_epochs=args.max_epochs, batch_size=args.batch_size)
-            val_loss, val_acc = lr_loss_and_accuracy(model, val_ids, y_val)
+                lr=lr, weight_decay=wd, max_epochs=args.max_epochs, batch_size=args.batch_size,
+                checkpoint_path=checkpoint_path)
+            val_loss, val_acc = evaluate(model, val_dataloader, criterion, "cpu")
 
-            # NEW: accuracy on the two validation-split probes
-            probe_acc = {}
-            for name in val_probes:
-                probs = predict_probs_in_chunks(model, val_probe_ids[name], "lr")
-                probe_acc[name] = float(np.mean(probs.argmax(dim=1).numpy() == val_probes[name][1]))
-
-            # NEW: robust selection score = average of the three accuracies.
-            # The leaderboard links differ from url_train.csv (it has many more NBC
-            # news links), so the validation check must include that difference
-            # too: "the validation set is like a sample exam" (L04 p.18).
-            score = (val_acc + probe_acc["NBC politics probe"] + probe_acc["Fox shopping probe"]) / 3
-
-            print(f"lr={lr:<4} weight_decay={wd:<6} best epoch={best_epoch:2d} | val loss {val_loss:.4f} "
-                  f"acc {val_acc:.4f} | NBC politics probe {probe_acc['NBC politics probe']:.3f} "
-                  f"Fox shopping probe {probe_acc['Fox shopping probe']:.3f} | score {score:.4f}")
+            print(f"lr={lr:<4} weight_decay={wd:<6} best epoch={best_epoch:2d} | "
+                  f"val loss {val_loss:.4f} acc {val_acc:.4f}")
             search_rows.append({"lr": lr, "weight_decay": wd, "best_epoch": best_epoch,
-                                "val_loss": val_loss, "val_acc": val_acc,
-                                "val_nbc_politics_probe": probe_acc["NBC politics probe"],
-                                "val_fox_shopping_probe": probe_acc["Fox shopping probe"],
-                                "selection_score": score})
-            # ORIGINAL (first version): choose by validation accuracy only
-            # if best is None or val_acc > best["val_acc"] or (val_acc == best["val_acc"] and val_loss < best["val_loss"]):
-            # NEW: choose by the robust score; on a tie, the lower validation loss
-            if best is None or score > best["score"] or (score == best["score"] and val_loss < best["val_loss"]):
+                                "val_loss": val_loss, "val_acc": val_acc})
+
+            # Choose the setting with the highest validation accuracy:
+            # the holdout method of L04 p.20, written like best_ccp_alpha_f1
+            # in hw2_skeleton.ipynb cell 72.
+            if val_acc > max_score:
+                max_score = val_acc
                 best = {"lr": lr, "weight_decay": wd, "best_epoch": best_epoch,
-                        "val_acc": val_acc, "val_loss": val_loss, "score": score,
+                        "val_acc": val_acc, "val_loss": val_loss,
                         "model": model, "history": history}
     pd.DataFrame(search_rows).to_csv(os.path.join(args.results_dir, "lr_search.csv"), index=False)
     print(f"Chosen: lr={best['lr']}, weight_decay={best['weight_decay']}, epochs={best['best_epoch']}")
@@ -789,11 +767,12 @@ def main():
     adamw_model = NewsClassifier()
     adamw_epoch, _ = train_logistic_regression(
         adamw_model, train_ids, y_train, val_ids, y_val, lr=0.01, weight_decay=0.1,
-        max_epochs=args.max_epochs, batch_size=args.batch_size, optimizer_name="adamw")
+        max_epochs=args.max_epochs, batch_size=args.batch_size,
+        checkpoint_path=checkpoint_path, optimizer_name="adamw")
     for name in eval_sets:
-        probs = predict_probs_in_chunks(adamw_model, eval_ids[name], "lr")
+        probs = predict_probs(adamw_model, eval_ids[name], "lr")
         row = {"model": "LR with AdamW (not used)", "set": name}
-        row.update(compute_metrics(probs.argmax(dim=1).numpy(), eval_sets[name][1]))
+        row.update(compute_metrics(probs.argmax(axis=1), eval_sets[name][1]))
         results.append(row)
 
     # -----------------------------------------------------------------------
@@ -815,26 +794,39 @@ def main():
     # -----------------------------------------------------------------------
     for which, label in [("lr", "Logistic regression"), ("tree", "Pruned tree"), ("ensemble", "LR + tree (final)")]:
         for name in eval_sets:
-            probs = predict_probs_in_chunks(eval_model, eval_ids[name], which)
+            probs = predict_probs(eval_model, eval_ids[name], which)
             row = {"model": label, "set": name}
-            row.update(compute_metrics(probs.argmax(dim=1).numpy(), eval_sets[name][1]))
+            row.update(compute_metrics(probs.argmax(axis=1), eval_sets[name][1]))
             results.append(row)
 
     results_df = pd.DataFrame(results)
     results_df.to_csv(os.path.join(args.results_dir, "metrics.csv"), index=False)
-    table = results_df.pivot(index="model", columns="set", values="accuracy")
-    table = table[["val", "test", "NBC politics probe", "Fox shopping probe"]]
-    # ORIGINAL (first version):
-    # table = table.loc[["Majority class", "Baseline NN", "Logistic regression", "Pruned tree", "LR + tree (final)"]]
-    # NEW: also show the AdamW comparison experiment
-    table = table.loc[["Majority class", "Baseline NN", "LR with AdamW (not used)",
-                       "Logistic regression", "Pruned tree", "LR + tree (final)"]]
-    print("\n=== Accuracy (probes: fraction of made-up links labelled correctly) ===")
-    print(table.round(4).to_string())
+
+    # Accuracy table: one row per model, one column per evaluation set
+    model_order = ["Majority class", "Baseline NN", "LR with AdamW (not used)",
+                   "Logistic regression", "Pruned tree", "LR + tree (final)"]
+    set_order = ["val", "test"]
+    accuracy_table = {}
+    for model_name in model_order:
+        accuracy_table[model_name] = []
+        for set_name in set_order:
+            for row in results:
+                if row["model"] == model_name and row["set"] == set_name:
+                    accuracy_table[model_name].append(row["accuracy"])
+
+    print("\n=== Accuracy ===")
+    print(f"{'model':26s}" + "".join(f"{s:>20s}" for s in set_order))
+    for model_name in model_order:
+        line = f"{model_name:26s}"
+        for acc in accuracy_table[model_name]:
+            line += f"{acc:>20.4f}"
+        print(line)
+
     print("\nConfusion matrix of the final ensemble on the test split (NBC = positive):")
-    final_test = results_df[(results_df["model"] == "LR + tree (final)") & (results_df["set"] == "test")].iloc[0]
-    print(f"  TP={final_test['TP']} FN={final_test['FN']} FP={final_test['FP']} TN={final_test['TN']} | "
-          f"NBC precision {final_test['nbc_precision']:.4f} recall {final_test['nbc_recall']:.4f}")
+    for row in results:
+        if row["model"] == "LR + tree (final)" and row["set"] == "test":
+            print(f"  TP={row['TP']} FN={row['FN']} FP={row['FP']} TN={row['TN']} | "
+                  f"NBC precision {row['nbc_precision']:.4f} recall {row['nbc_recall']:.4f}")
 
     # -----------------------------------------------------------------------
     # Step 7: figures (same style as hw3_skeleton.ipynb cell 90)
@@ -860,11 +852,11 @@ def main():
     # 7b. one line per model across the four evaluation sets (includes the baseline,
     #     as the project asks: Project_Intro p.15 section 4.1)
     plt.figure(figsize=(8, 5))
-    for model_name in table.index:
-        plt.plot(list(table.columns), list(table.loc[model_name]), marker="o", label=model_name)
+    for model_name in model_order:
+        plt.plot(set_order, accuracy_table[model_name], marker="o", label=model_name)
     plt.ylim(0, 1.05)
     plt.ylabel("accuracy")
-    plt.title("Model comparison (probes are made-up links)")
+    plt.title("Model comparison")
     plt.legend()
     plt.grid(alpha=0.25)
     plt.tight_layout()
